@@ -1,0 +1,636 @@
+/*
+ * mm.c
+ *
+ * NOTE TO STUDENTS: Replace this header comment with your own header
+ * comment that gives a high level description of your solution.
+ */
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "mm.h"
+#include "memlib.h"
+
+/* If you want debugging output, use the following macro.  When you hand
+ * in, remove the #define DEBUG line. */
+#define DEBUG
+#ifdef DEBUG
+# define dbg_printf(...) printf(__VA_ARGS__)
+#else
+# define dbg_printf(...)
+#endif
+
+
+/* do not change the following! */
+#ifdef DRIVER
+/* create aliases for driver tests */
+#define malloc mm_malloc
+#define free mm_free
+#define realloc mm_realloc
+#define calloc mm_calloc
+#endif /* def DRIVER */
+
+/* single word (4) or double word (8) alignment */
+#define ALIGNMENT 8
+
+/* rounds up to the nearest multiple of ALIGNMENT */
+#define ALIGN(p) (((size_t)(p) + (ALIGNMENT-1)) & ~0x7)
+
+/*macros from csapp.cs.cmu.edu*/
+#define WSIZE       4       /* Word and header/footer size (bytes) */ //line:vm:mm:beginconst
+#define DSIZE       8       /* Doubleword size (bytes) */
+#define CHUNKSIZE  (1<<12)  /* Extend heap by this amount (bytes) */  //line:vm:mm:endconst 
+
+#define MAX(x, y) ((x) > (y)? (x) : (y))  
+
+/* Pack a size and allocated bit into a word */
+#define PACK(size, alloc)  ((size) | (alloc)) //line:vm:mm:pack
+
+/* Read and write a word at address p */
+#define GET(p)       (*(unsigned int *)(p))            //line:vm:mm:get
+#define PUT(p, val)  (*(unsigned int *)(p) = (val))    //line:vm:mm:put
+
+/* Read the size and allocated fields from address p */
+#define GET_SIZE(p)  (GET(p) & ~0x7)                   //line:vm:mm:getsize
+#define GET_ALLOC(p) (GET(p) & 0x1)                    //line:vm:mm:getalloc
+
+/* Given block ptr bp, compute address of its header and footer */
+#define HDRP(bp)       ((char *)(bp) - WSIZE)                      //line:vm:mm:hdrp
+#define FTRP(bp)       ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE) //line:vm:mm:ftrp
+
+/* Given block ptr bp, compute address of next and previous blocks */
+#define NEXT_BLKP(bp)  ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE))) //line:vm:mm:nextblkp
+#define PREV_BLKP(bp)  ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE))) //line:vm:mm:prevblkp
+/*macros written by me*/
+#define GETL(p) (*(unsigned long *)(p))
+#define PUTL(p, val) (*(unsigned long *)(p) = (val))
+#define NEXT_FREE(bp) ((char *)GETL(bp))
+#define PREV_FREE(bp) ((char *)GETL((char *)bp + DSIZE))
+#define SET_NF(bp, val) PUTL((char *)bp, (long)val)
+#define SET_PF(bp, val) PUTL((char *)bp + DSIZE, (long)val)
+
+//#define NEXT_FREE(bp) (*(void **)(bp))
+//#define PREV_FREE(bp) (*(void **)((bp) + DSIZE))
+#define LIST_SIZE 14
+
+/*static functions*/
+static void *extend_heap(size_t size);
+static void *coalesce(void *bp);
+static void add_node(void *bp);
+static void delete_node(void *bp);
+static int list_idx(size_t size);
+static void *find_fit(size_t size);
+static void place(void *bp, size_t size);
+static void checkblock(void *bp, int lineno);
+
+/*global variables*/
+static char *heap_listp = 0;
+void *seglist[LIST_SIZE];
+int add = 0;
+int delete = 0;
+int coala = 0;
+int extend = 0;
+/*
+ * Initialize: return -1 on error, 0 on success.
+ */
+int mm_init(void) {
+    
+    printf("init called\n");
+    if((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1) return -1;
+
+    for(int i = 0; i < LIST_SIZE; i++)
+    {
+        seglist[i] = NULL;
+    }
+    //padding
+    PUT(heap_listp, 0);
+    //prevalloc of prologue set to 1?
+    //header
+    PUT(heap_listp + (1*WSIZE), PACK(DSIZE, 1));
+    //footer
+    PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1));
+    //prevalloc of epilogue set to 1?
+    PUT(heap_listp + (3*WSIZE), PACK(0, 1));
+    heap_listp += 2*WSIZE;
+
+    if(extend_heap(CHUNKSIZE/WSIZE) == NULL) return -1;
+    //mm_checkheap(__LINE__);
+    return 0;
+}
+
+static void *extend_heap(size_t words) 
+{
+        char *bp;
+        char *rt;
+        size_t size;
+        extend++;
+    printf("extend_heap called %d times\n", extend);
+        /* Allocate an even number of words to maintain alignment */
+        size = (words % 2) ? (words+1) * WSIZE : words * WSIZE; 
+        if ((long)(bp = mem_sbrk(size)) == -1) return NULL;      
+        /* Initialize free block header/footer and the epilogue header */
+        PUT(HDRP(bp), PACK(size, 0));         /* Free block header */
+        PUT(FTRP(bp), PACK(size, 0));         /* Free block footer */
+        PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); /* New epilogue header */ 
+        
+        /* Coalesce if the adjacent blocks are free */
+        rt = coalesce(bp);
+        //mm_checkheap(__LINE__);
+        return rt;
+}
+
+static void add_node(void *bp)
+{
+    add++;
+    printf("add node called\n");
+    int seg_idx = list_idx(GET_SIZE(HDRP(bp)));
+    void *temp;
+    SET_PF(bp, NULL);
+
+
+    //PREV_FREE(bp) = NULL;
+    for(int i = 0; i <LIST_SIZE; i++)
+    {
+        printf("add node before %p\n", seglist[i]);
+    }
+
+    for(temp = seglist[seg_idx]; temp != NULL; temp = NEXT_FREE(temp))
+    {
+        printf("elements in requested index %p\n", temp);
+    }
+
+    if(seglist[seg_idx] == NULL)
+    {
+        printf("case1\n");
+        SET_NF(bp, NULL);
+        //NEXT_FREE(bp) = NULL;
+    }
+    else
+    {
+        printf("case2\n");
+        SET_NF(bp, seglist[seg_idx]);
+        SET_PF(seglist[seg_idx], bp);
+        //NEXT_FREE(bp) = seglist[seg_idx];
+        //PREV_FREE(seglist[seg_idx]) = bp;
+    }
+    seglist[seg_idx] = bp;
+    
+    for(int i = 0; i <LIST_SIZE; i++)
+    {
+        printf("add node after %p\n", seglist[i]);
+    }
+    
+    for(temp = seglist[seg_idx]; temp != NULL; temp = NEXT_FREE(temp))
+    {
+        printf("elements in requested index %p\n", temp);
+    }
+    printf("first item %p\n", seglist[seg_idx]);
+    printf("second item %p\n", NEXT_FREE(seglist[seg_idx]));
+    //mm_checkheap(__LINE__);
+}
+
+static void delete_node(void *bp)
+{
+    delete++;
+    
+    for(int i = 0; i <LIST_SIZE; i++)
+    {
+        printf("delete node before %p\n", seglist[i]);
+    }
+    
+    printf("delete node called\n");
+    void *prev_fr = PREV_FREE(bp);
+    void *next_fr = NEXT_FREE(bp);
+    int seg_idx = list_idx(GET_SIZE(HDRP(bp)));
+
+    if(prev_fr != NULL && next_fr != NULL)
+    {
+        SET_PF(next_fr, prev_fr);
+        SET_NF(prev_fr, next_fr);
+        //PREV_FREE(next_fr) = prev_fr;
+        //NEXT_FREE(prev_fr) = next_fr;
+    }
+    else if(prev_fr != NULL && next_fr == NULL) 
+    {
+        SET_NF(prev_fr, NULL);
+        //NEXT_FREE(prev_fr) = NULL;
+    }
+    else if(prev_fr == NULL && next_fr != NULL)
+    {
+        SET_PF(next_fr, NULL);
+        //PREV_FREE(next_fr) = NULL;
+        seglist[seg_idx] = next_fr;
+    }
+    //prev_fr == NULL && next_fr == NULL
+    else
+    {
+        seglist[seg_idx] = NULL;
+    }
+//may be unecessary
+    SET_NF(bp, NULL);
+    SET_PF(bp, NULL);
+    //NEXT_FREE(bp) = NULL;
+    //PREV_FREE(bp) = NULL;
+    for(int i = 0; i <LIST_SIZE; i++)
+    {
+        printf("delete node after %p\n", seglist[i]);
+    }
+}
+
+static void *coalesce(void *bp)
+{
+    coala++;
+    printf("coalesce called\n");
+    void *prev_hd= HDRP(PREV_BLKP(bp));
+    void *curr_hd = HDRP(bp);
+    void *next_hd = HDRP(NEXT_BLKP(bp));
+    
+    size_t prev_alloc = GET_ALLOC(prev_hd);
+    size_t next_alloc = GET_ALLOC(next_hd);
+
+    size_t size_bp = GET_SIZE(curr_hd);
+    size_t new_size;
+    void *new_blk;
+ 
+    //case 1
+    if(prev_alloc && next_alloc)
+    {
+        add_node(bp);
+        mm_checkheap(__LINE__);
+        return bp;
+    }
+    //case 2
+    else if(prev_alloc && !next_alloc)
+    {
+        delete_node(NEXT_BLKP(bp));
+        new_size = size_bp + GET_SIZE(next_hd);
+        PUT(HDRP(bp), PACK(new_size, 0));
+        PUT(FTRP(bp), PACK(new_size, 0));
+        add_node(bp);
+        mm_checkheap(__LINE__);
+        return bp;
+    }
+    //case 3
+    else if(!prev_alloc && next_alloc)
+    {
+        
+        delete_node(PREV_BLKP(bp));
+        new_blk = PREV_BLKP(bp);
+        new_size = size_bp + GET_SIZE(HDRP(new_blk));
+        
+        PUT(HDRP(new_blk), PACK(new_size, 0));
+        PUT(FTRP(new_blk), PACK(new_size, 0));
+        add_node(new_blk);
+        mm_checkheap(__LINE__);
+        return new_blk;
+    }
+    //case 4
+    else
+    {
+
+        delete_node(PREV_BLKP(bp));
+        delete_node(NEXT_BLKP(bp));
+        
+        new_blk = PREV_BLKP(bp);
+        new_size = size_bp + GET_SIZE(next_hd) + GET_SIZE(prev_hd);
+        
+        PUT(HDRP(new_blk), PACK(new_size, 0));
+        PUT(FTRP(new_blk), PACK(new_size, 0));
+        
+        add_node(new_blk);
+        mm_checkheap(__LINE__);
+        return new_blk;
+    }
+}
+
+static int list_idx(size_t size)
+{
+    printf("Requested node of size %lu\n", size);
+    if(size <= 25) return 0;
+    if(size <= 50) return 1;
+    if(size <= 75) return 2;
+    if(size <= 100) return 3;
+    if(size <= 150) return 4;
+    if(size <= 200) return 5;
+    if(size <= 400) return 6;
+    if(size <= 800) return 7;
+    if(size <= 1600) return 8;
+    if(size <= 3200) return 9;
+    if(size <= 6400) return 10;
+    if(size <= 12800) return 11;
+    if(size <= 25600) return 12;
+    else return 13;
+}
+
+//first fit strategy
+static void *find_fit(size_t size)
+{
+    printf("find_fit called\n");
+    int seg_idx = list_idx(size);
+    void *bp;
+    for(int i = seg_idx; i < LIST_SIZE; i++)
+    {
+        for(bp = seglist[seg_idx]; bp != NULL; bp = NEXT_FREE(bp))
+        {
+            if(size <= GET_SIZE(HDRP(bp)))
+            {
+               printf("actually in seglist\n");
+                return bp;
+            }
+        }
+    }
+    for(int i = 0; i <LIST_SIZE; i++)
+    {
+        printf("find fit print %p\n", seglist[i]);
+    }
+    return NULL;
+}
+
+/*
+//best 10 fit strategy
+static void *find_fit(size_t size)
+{
+    int seg_idx = list_idx(size);
+    char *fit = NULL;
+    char *bp = NULL;
+    int counter = 0;
+    size_t diff_min = ~0;
+    size_t diff;
+    for(int i = seg_idx; i < LIST_SIZE; i++)
+    {
+        for(bp = seglist[seg_idx]; bp != NULL; bp = NEXT_FREE(bp))
+        {
+            if(size <= GET_SIZE(HDRP(bp)))
+            {
+                diff = GET_SIZE(HDRP(bp)) - size;
+                if(diff < diff_min)
+                {
+                    diff_min = diff;
+                    fit = bp;
+                }
+                counter++;
+                if(counter == 10)return fit;
+            }
+        }
+    }
+    return fit;
+}
+*/
+
+static void place(void *bp, size_t size)
+{
+    //intf("place called\n");
+    size_t blk_size = GET_SIZE(HDRP(bp));
+    delete_node(bp);
+    size_t diff = blk_size - size;
+    //split
+    if(diff >= 3*DSIZE)
+    {
+        PUT(HDRP(bp), PACK(size, 1));
+        PUT(FTRP(bp), PACK(size, 1));
+        bp = NEXT_BLKP(bp);
+        PUT(HDRP(bp), PACK(diff, 0));
+        PUT(FTRP(bp), PACK(diff, 0));
+        add_node(bp);
+    }
+    //use the whole bp
+    else
+    {
+        PUT(HDRP(bp), PACK(blk_size, 1));
+        PUT(FTRP(bp), PACK(blk_size, 1));
+    }
+    //mm_checkheap(__LINE__);
+}
+/*
+ * malloc
+ */
+void *malloc (size_t size) {
+    printf("malloc called\n");
+    
+    for(int i = 0; i <LIST_SIZE; i++)
+    {
+      printf("malloc print bf %p\n", seglist[i]);
+    }
+    size_t block_size;
+    size_t extendsize;
+    void *bp;
+    if(size == 0) return NULL;
+    if(size <= DSIZE) block_size = 3*DSIZE;
+    else
+    {
+        block_size = ALIGN(size + DSIZE);
+        //DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+    }
+    //find an appropriate free block
+    if((bp = find_fit(block_size)) != NULL)
+    {
+        place(bp, block_size);
+        return bp;
+    }
+    for(int i = 0; i <LIST_SIZE; i++)
+    {
+        printf("malloc print af %p\n", seglist[i]);
+    }
+    //reach this part if no free block available
+    extendsize = MAX(block_size, CHUNKSIZE);
+    if((bp = extend_heap(extendsize/WSIZE)) == NULL) return NULL;
+    place(bp, block_size);
+    mm_checkheap(__LINE__);
+    return bp;
+}
+
+/*
+ * free
+ */
+void free (void *ptr) {
+    printf("free called\n");
+    if(ptr == 0) return;
+    size_t size = GET_SIZE(HDRP(ptr));
+    //need to put the freed block on the list!
+    PUT(HDRP(ptr), PACK(size, 0));
+    PUT(FTRP(ptr), PACK(size, 0));
+    coalesce(ptr);
+    //mm_checkheap(__LINE__);
+}
+
+/*
+ * realloc - you may want to look at mm-naive.c
+ */
+void *realloc(void *oldptr, size_t size) {
+    printf("realloc called\n");
+    size_t oldsize;
+    void *newptr;
+    if(size == 0)
+    {
+        free(oldptr);
+        return 0;
+    }
+    if(oldptr == NULL)
+    {
+        return malloc(size);
+    }
+
+    newptr = malloc(size);
+    
+    if(!newptr) return 0;
+    
+    oldsize = GET_SIZE(HDRP(oldptr));
+    if(size < oldsize) oldsize = size;
+
+    memcpy(newptr, oldptr, oldsize);
+    free(oldptr);
+    return newptr;
+}
+
+/*
+ * calloc - you may want to look at mm-naive.c
+ * This function is not tested by mdriver, but it is
+ * needed to run the traces.
+ */
+void *calloc (size_t nmemb, size_t size) {
+    printf("calloc called\n");
+    size_t bytes = nmemb * size;
+    void *newptr;
+
+    newptr = malloc(bytes);
+    memset(newptr, 0, bytes);
+
+    return newptr;
+}
+
+
+/*
+ * Return whether the pointer is in the heap.
+ * May be useful for debugging.
+ */
+static int in_heap(const void *p) {
+    return p <= mem_heap_hi() && p >= mem_heap_lo();
+}
+
+/*
+ * Return whether the pointer is aligned.
+ * May be useful for debugging.
+ */
+static int aligned(const void *p) {
+    return (size_t)ALIGN(p) == (size_t)p;
+}
+
+/*
+ * mm_checkheap
+ * 1. check epilogue & prologue
+ * 2. block address alignment
+ * 3. heap boundaries
+ * 4. check coalescing (no two consec freeblks)
+ * For each block, check hdr & ftr
+ * 1. size, allocate bit consistency
+ * 2. header = footer?
+ */
+void mm_checkheap(int lineno) {
+    /*lineno = lineno;
+    aligned(NULL);
+    in_heap(NULL);*/
+    char *bp = heap_listp;
+    char *hp = heap_listp;
+    char *check = NULL;
+    int list_free = 0;
+    int heap_free = 0;
+
+    if((GET_SIZE(HDRP(heap_listp)) != DSIZE) || !GET_ALLOC(HDRP(heap_listp)))
+    {
+        printf("prologue fucked up at line %d\n", lineno);
+        exit(1);
+    }
+
+    checkblock(heap_listp, lineno);
+    
+    for(hp = heap_listp; GET_SIZE(HDRP(hp)) > 0; hp = NEXT_BLKP(hp))
+    {
+        if(!GET_ALLOC(HDRP(hp))) heap_free++;
+        //printf("address: %p header: %u footer: %u\n",hp, GET(HDRP(hp)), GET(FTRP(hp)));
+    }
+    
+    for(bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp))
+    {
+        checkblock(bp, lineno);
+    }
+
+    if((GET_SIZE(HDRP(bp)) != 0) || !GET_ALLOC(HDRP(bp)))
+    {
+        printf("epilogue fucked up at line %d\n", lineno);
+        exit(1);
+    }
+
+   
+    for(int i = 0; i < LIST_SIZE; i++)
+    {
+        for(check = seglist[i]; check != NULL; check = NEXT_FREE(check))
+        {
+            checkblock(check, lineno);
+            if(NEXT_FREE(check) != NULL 
+                    && PREV_FREE(NEXT_FREE(check)) != check)
+            {
+                printf("block %p and %d don't point to each other: line %d\n"
+                        ,check, i, lineno);
+                exit(1);
+            }
+            if(check == seglist[i] && PREV_FREE(check) != NULL)
+            {
+                printf("block %p, the first item in list %d, has none null prev: line %d\n"
+                        , check, i, lineno);
+                exit(1);
+            }
+            if(list_idx(GET_SIZE(HDRP(check))) != i)
+            {
+                printf("block %p is in wrong index. index->%d correct index->%d, size %d: line %d\n"
+                        , check, i, list_idx(GET_SIZE(HDRP(check))), GET_SIZE(HDRP(check)), lineno);
+                exit(1);
+            }
+            if(GET_ALLOC(HDRP(check)))
+            {
+                printf("alloc block %p is in free list: line %d\n"
+                       , check, lineno);
+            }
+            list_free++;
+        }
+    }
+
+    
+
+    if(heap_free != list_free)
+    {
+        printf("number of free blocks in list and heap don't fucking match: line %d\n"
+                , lineno);
+        exit(1);
+    }
+}
+
+static void checkblock(void *bp, int lineno)
+{
+    if(!aligned(bp))
+    {
+        printf("%p why u no dword align: line %d\n", bp, lineno);
+        exit(1);
+    }
+    if(GET(HDRP(bp)) != GET(FTRP(bp))) 
+    {
+        printf("header != footer at %p: line %d\n", bp, lineno);
+        printf("%u %u %u\n", GET(HDRP(bp)), GET(FTRP(bp)), GET_SIZE(HDRP(bp)));
+        exit(1);
+    }
+    if(!in_heap(bp))
+    {
+        printf("%p so thug not in heap: line %d\n", bp, lineno);
+        exit(1);
+    }
+    if(NEXT_BLKP(bp) != NULL)
+    {
+        if(GET_ALLOC(HDRP(bp)) == 0 && GET_ALLOC(HDRP(NEXT_BLKP(bp))) == 0)
+        {
+            printf("coalescing didn't quite work out with %p: line %d\n"
+                    , bp, lineno);
+            exit(1);
+        }
+    }
+}
